@@ -59,5 +59,8 @@ begin
   if I = 0 then Exit;
   Delete(S, I, Length(Dir) + 1); // drops ';Dir', keeping the ';' that follows it
   if Length(S) > 2 then P := Copy(S, 2, Length(S) - 2) else P := '';
-  RegWriteExpandStringValue(HKCU, EnvKey, 'Path', P);
+  if P = '' then
+    RegDeleteValue(HKCU, EnvKey, 'Path') // the install created the value, so remove it rather than leave it empty
+  else
+    RegWriteExpandStringValue(HKCU, EnvKey, 'Path', P);
 end;

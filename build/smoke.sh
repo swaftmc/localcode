@@ -17,7 +17,10 @@ failures=0
 
 check() { # check <description> <command...>
   local what=$1; shift
-  if "$@"; then echo "ok   $what"; else echo "FAIL $what"; failures=$((failures + 1)); fi
+  if "$@"; then echo "ok   $what"; else
+    echo "FAIL $what (rc=${rc:-?}); last output:"; sed 's/^/     | /' "$work/out.txt" 2>/dev/null || true
+    failures=$((failures + 1))
+  fi
 }
 # Run with an empty environment plus junk Python variables, so nothing but the bundled runtime can be used.
 # Output and exit code land in $work/out.txt and $rc; stdin comes from $IN (default: empty).
@@ -47,6 +50,7 @@ check "the bundled Python has the modules localcode needs" test $rc = 0
 
 if command -v docker >/dev/null 2>&1; then
   # Debian 11 has glibc 2.31 and no Python: proves the launcher and runtime need nothing from the host.
+  docker pull -q debian:11-slim > /dev/null  # keeps pull messages out of the output compared below
   docker run --rm -v "$work/localcode:/lc:ro" debian:11-slim /lc/localcode --version > "$work/out.txt" 2>&1 && rc=0 || rc=$?
   check "runs inside debian:11-slim (glibc 2.31, no Python installed)" test "$(cat "$work/out.txt")" = "localcode $version"
 else
