@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+__version__ = "1.0.0"
 ROOT = Path.cwd().resolve()
 SHELL_TIMEOUT = 60      # seconds before a shell command is killed
 OLD_TOOL_KEEP = 400     # chars an old tool output is shortened to when trimming
@@ -713,6 +714,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.2, help="sampling temperature, 0 to 2 (default %(default)s)")
     ap.add_argument("--max-steps", type=int, default=10, help="tool-call cap per user turn (default %(default)s)")
     ap.add_argument("--verbose", action="store_true", help="show raw tool-call blocks (toggle with /verbose)")
+    ap.add_argument("--version", action="version", version=f"localcode {__version__}")
     args = ap.parse_args()
     COLOR = enable_color()
     try:

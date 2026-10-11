@@ -4,15 +4,30 @@ A terminal coding agent for small, locally hosted models (1.5B to 8B). One Pytho
 
 ## Install
 
-Needs Python 3.10+ and a running local server. No pip packages.
+localcode talks to a model server you already run locally, such as Ollama, llama.cpp, LM Studio or KoboldCpp. Download the build for your system from the [latest release](https://github.com/swaftmc/localcode/releases/latest). Each one bundles its own Python 3.11, so nothing else needs to be installed.
+
+| System | Download | Setup |
+|---|---|---|
+| Windows 64-bit | `localcode-<version>-windows-x64-setup.exe` | Run it. It installs per user and adds localcode to your PATH. |
+| Windows 64-bit | `localcode-<version>-windows-x64.zip` | Unzip anywhere and add the `localcode` folder to your PATH, or run `localcode\localcode.exe` directly. |
+| Linux x86_64 | `localcode-<version>-linux-x64.tar.gz` | `tar -xzf` it, then run `localcode/localcode`. To use it from anywhere: `ln -s "$PWD/localcode/localcode" ~/.local/bin/localcode`. |
+| Linux ARM64 | `localcode-<version>-linux-arm64.tar.gz` | The same as x86_64. |
+
+The Linux builds need glibc 2.17 or newer (most distributions from 2014 on). Alpine and other musl-based systems aren't supported. The Windows files aren't code-signed, so SmartScreen may ask you to click "More info" and then "Run anyway". Check a download against `SHA256SUMS.txt` from the release if you like.
+
+Then, from the folder you want to work in:
 
 ```
-git clone <this repo> localcode
-cd your-project
-python path/to/localcode/localcode.py
+localcode --model qwen2.5-coder:1.5b --ctx 4096 --max-prompt 3000
 ```
 
 localcode works in the directory you start it from. File tools can't reach outside that directory.
+
+**From source:** with Python 3.10 or newer and no other packages, `python localcode.py` takes the same arguments.
+
+## License
+
+Free for noncommercial use under the [PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use needs a separate license from the author: open an issue on this repository or contact [@swaftmc](https://github.com/swaftmc) first. The bundled CPython runtime keeps its own license, in the `runtime` folder.
 
 ## Flags
 

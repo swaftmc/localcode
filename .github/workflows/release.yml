@@ -1,0 +1,81 @@
+name: release
+
+# Pushing a tag like v1.0.0 builds every download, smoke-tests it, and publishes the GitHub release.
+# "Run workflow" (workflow_dispatch) does the same builds and tests without publishing anything.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches the version in localcode.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: test "$GITHUB_REF_NAME" = "v$(grep -m1 '^__version__ = ' localcode.py | cut -d'"' -f2)"
+      - name: Install Inno Setup
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+      - name: Build
+        run: ./build/build.ps1
+      - name: Smoke test
+        run: ./build/smoke.ps1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: dist/*
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, arch: x64 }
+          - { runner: ubuntu-22.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: bash build/build.sh
+      - name: Smoke test
+        run: bash build/smoke.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * | tee SHA256SUMS.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          Run \`localcode --model <name>\` from the folder you want it to work in. It talks to a local OpenAI-compatible server such as Ollama or llama.cpp.
+
+          - **Windows:** run \`localcode-${GITHUB_REF_NAME#v}-windows-x64-setup.exe\` (adds localcode to your PATH), or unzip the \`.zip\` anywhere. Windows SmartScreen may ask you to click "More info" then "Run anyway", because the files are not code-signed.
+          - **Linux:** extract the \`.tar.gz\` for your CPU (x64 or arm64), then run \`localcode/localcode\` or add that folder to your PATH.
+          - Each download bundles its own Python 3.11, so nothing else needs to be installed. Check downloads against \`SHA256SUMS.txt\`.
+
+          Free for noncommercial use under the PolyForm Noncommercial License 1.0.0. Commercial use needs a separate license from the author: see the LICENSE file.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "localcode ${GITHUB_REF_NAME#v}" --notes-file notes.md
