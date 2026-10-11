@@ -34,12 +34,13 @@ Rules:
 - One tool call per reply. Never write the tool result yourself.
 - Read a file before editing it. "old" must match the file text exactly and only once.
 - Paths are relative to the working directory.
-- When the task is done, answer in plain text with no tool block. Be brief."""
+- When the task is done, reply with no tool block: a short Markdown answer saying what you did.
+- Never put a normal answer inside a code block."""
 
 CORRECTION = """Your tool call was invalid: {err}
 Either send one ```tool block using a tool from the list, or, if the task is done, reply in plain text with no tool block."""
 
-NUDGE = "[end of result] If this answers the task, reply to the user in plain text now. Otherwise call the next tool."
+NUDGE = "[end of result] If the task is done, tell the user in one sentence what you did; don't repeat this result. Otherwise call the next tool."
 
 DENIED = "The user denied this action. Try a different approach, or ask the user in plain text."
 
@@ -52,14 +53,23 @@ HELP = """/help              show this help
 /tokens            show estimated prompt size against the limits
 /temperature T     set the sampling temperature (0 to 2)
 /maxsteps N        set the tool-call cap per user turn
+/verbose           show or hide the raw tool-call blocks
 /exit              quit"""
 
-DIM = RESET = ""
+STY = {"bold": "\033[1m", "dim": "\033[2m", "code": "\033[36m", "head": "\033[1;34m", "quote": "\033[3m",
+       "red": "\033[31m", "green": "\033[32m"}
+RESET = "\033[0m"
+COLOR = False  # set in main() when the terminal shows ANSI styles
+
+
+def paint(text, style):
+    """Wrap text in an ANSI style when colors are on."""
+    return f"{STY[style]}{text}{RESET}" if COLOR else text
 
 
 def dim(text):
     """Print a dim status line."""
-    print(f"{DIM}{text}{RESET}", flush=True)
+    print(paint(text, "dim"), flush=True)
 
 
 def show(text):
@@ -177,6 +187,168 @@ def _check_call(obj):
     return name, args
 
 
+def call_summary(name, args):
+    """One-line description of a tool call, shown instead of the raw block."""
+    path, n = args.get("path") or ".", len(str(args.get("content", "")).splitlines())
+    lines = f" lines {args.get('start') or 1}-{args.get('end') or 'end'}" if args.get("start") or args.get("end") else ""
+    return {"read": path + lines, "write": f"{path} ({n} line{'s' * (n != 1)})", "edit": path, "ls": path,
+            "grep": f'"{args.get("pattern")}" in {path}', "shell": str(args.get("command"))}[name]
+
+
+MARK_CHARS = set(" \t#-*+>_.)0123456789")  # chars that may still turn into a block marker at line start
+LINE_STYLES = [(re.compile(r"(\s*)#{1,6} "), "", "head"), (re.compile(r"(\s*)[-*+] "), "• ", ""),
+               (re.compile(r"(\s*)> ?"), "│ ", "quote")]
+HR_RE = re.compile(r"\s*([-*_])(?:\s*\1){2,}\s*")
+
+
+class Markdown:
+    """Stream markdown to the terminal with ANSI styles, hiding tool-call blocks unless verbose."""
+    # ponytail: styles chars as they arrive (headings, lists, quotes, rules, **bold**, `code`, fenced blocks).
+    # No tables, nesting or syntax highlighting; upgrade path is a real markdown renderer such as rich.
+
+    def __init__(self, write, styled, verbose):
+        self.write, self.styled, self.verbose = write, styled, verbose
+        self.line = self.held = self.probe = self.base = ""
+        self.block = None  # None, "code", "probe" (``` or ```json that may open a tool call) or "tool"
+        self.open = self.raw = self.bold = self.code = self.marker = False
+        self.at_start = True
+
+    def _out(self, s):
+        if s:
+            self.write(s)
+            self.marker, self.at_start = False, s.endswith("\n")
+
+    def feed(self, text):
+        """Render the next streamed piece of the reply."""
+        for ch in text:
+            if self.block == "tool":  # the rest of the reply is the call; anything after it is dropped anyway
+                if self.verbose:
+                    self._out(ch)
+            elif self.open:
+                self._end_line() if ch == "\n" else self._inline(ch)
+            else:  # hold the line start until it can't become a block marker
+                self.line += ch
+                s = self.line.lstrip()
+                if ch == "\n":
+                    line, self.line = self.line[:-1], ""
+                    self._whole_line(line)
+                elif ch not in MARK_CHARS and not (self.block == "probe" or s.startswith("`")
+                                                   or (self.block is None and s.startswith("<"))):
+                    line, self.line = self.line, ""
+                    self._start_line(line)
+
+    def _start_line(self, text):
+        """Write the line's block marker and style, then stream the rest of the line."""
+        self.open = True
+        if self.block == "code":
+            self.raw, self.base = True, STY["code"] if self.styled else ""
+            self._out(f"{STY['dim']}│ {RESET}{self.base}" if self.styled else "")
+            return self._out(text)
+        for rx, fancy, style in LINE_STYLES:
+            if m := rx.match(text):
+                self.base = STY.get(style, "") if self.styled else ""
+                self._out((m.group(1) + fancy if self.styled else m.group()) + self.base)
+                text = text[m.end():]
+                break
+        for ch in text:
+            self._inline(ch)
+
+    def _inline(self, ch):
+        """Stream one char, turning ** into bold and backtick runs into inline code."""
+        if self.raw:
+            return self._out(ch)
+        if self.held and ch != self.held[0]:
+            self._flush_held()
+        if ch == "`" or (ch == "*" and not self.code):
+            self.held += ch
+        else:
+            self._out(ch)
+
+    def _flush_held(self):
+        run, self.held = self.held, ""
+        if not self.styled or (run[0] == "*" and len(run) != 2):
+            return self._out(run)
+        if run[0] == "`":
+            self.code = not self.code
+        else:
+            self.bold = not self.bold
+        self._out(RESET + self.base + STY["bold"] * self.bold + STY["code"] * self.code)
+
+    def _end_line(self):
+        if self.held:
+            self._flush_held()
+        if self.styled and (self.base or self.bold or self.code):
+            self._out(RESET)
+        self._out("\n")
+        self.open = self.raw = self.bold = self.code = False
+        self.base = ""
+
+    def _whole_line(self, line):
+        """Render a line that had to be seen whole: fences, tool-call openers, rules and marker-only lines."""
+        s = line.strip()
+        if self.block == "probe":  # the line after ``` or ```json decides: tool call or code block
+            fence, self.block = self.probe, None
+            if LOOKS_LIKE_CALL.match(line):
+                self._tool_start(fence)
+                return self.feed(line + "\n")
+            self.block = "code"
+            self._fence(fence)
+        if self.block == "code":
+            if s.startswith("```"):
+                self.block = None
+                return self._fence(line)
+            self._start_line(line)
+            return self._end_line()
+        if s.startswith(("```", "<tool_call>")):
+            inner = s[3:-3] if len(s) > 6 and s.endswith("```") else None
+            lang = s[3:].strip().lower()
+            if s.startswith("<") or re.match(r"tool\b", lang) or (
+                    inner is not None and LOOKS_LIKE_CALL.match(re.sub(r"^json\b", "", inner))):
+                return self._tool_start(line)
+            if inner is None and lang in ("", "json"):
+                self.block, self.probe = "probe", line
+                return
+            if inner is None:
+                self.block = "code"
+                return self._fence(line)
+        if HR_RE.fullmatch(line):  # a one-line ```text``` falls through to here and renders as inline code
+            return self._out((paint("─" * 40, "dim") if self.styled else line) + "\n")
+        self._start_line(line)
+        self._end_line()
+
+    def _fence(self, line):
+        if not self.styled:  # styled output shows code blocks by their │ gutter instead
+            self._out(line + "\n")
+
+    def _tool_start(self, line):
+        self.block = "tool"
+        if self.verbose:
+            self._out((STY["dim"] if self.styled else "") + line + "\n")
+        elif self.styled:
+            self._out(f"{STY['dim']}● tool call…{RESET}\n")
+            self.marker = True
+
+    def close(self):
+        """Finish the reply: render any partial line and reset styles."""
+        if self.open:
+            self._end_line()
+        elif self.line:
+            line, self.line = self.line, ""
+            self._whole_line(line)
+        if self.block == "probe":
+            self._fence(self.probe)
+        if self.block == "tool" and self.verbose and self.styled:
+            self.write(RESET)  # not _out: a reset doesn't move the cursor
+        if not self.at_start:
+            self._out("\n")
+        self.block = None
+
+    def status(self, line):
+        """Print a line, replacing the "tool call…" marker if it is still the last thing on screen."""
+        self.write(("\033[1A\033[2K" if self.marker else "") + line + "\n")
+        self.marker, self.at_start = False, True
+
+
 def resolve(p):
     """Resolve a tool path, refusing anything outside the working directory."""
     path = (ROOT / str(p)).resolve()
@@ -283,8 +455,8 @@ def http(url, body=None, timeout=10):
 
 
 class Agent:
-    def __init__(self, url, model, ctx, max_prompt, max_tokens, temperature, max_steps):
-        self.url = url.rstrip("/")
+    def __init__(self, url, model, ctx, max_prompt, max_tokens, temperature, max_steps, verbose=False):
+        self.url, self.verbose = url.rstrip("/"), verbose
         self.base = re.sub(r"/v1$", "", self.url)
         self.native = self.is_ollama()
         self.ratio, self.last_used, self.last_note, self.allowed = 3.0, None, "", set()
@@ -348,33 +520,36 @@ class Agent:
                 "model": self.model, "messages": msgs, "stream": True, "max_tokens": self.max_tokens,
                 "temperature": self.temperature, "stream_options": {"include_usage": True}}
         text, used = [], None
-        with http(url, body, timeout=600) as r:
-            for raw in r:
-                line = raw.decode("utf-8", "replace").strip()
-                if not self.native:
-                    if not line.startswith("data:"):
+        md = self.md = Markdown(lambda s: print(s, end="", flush=True), COLOR, self.verbose)
+        try:
+            with http(url, body, timeout=600) as r:
+                for raw in r:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not self.native:
+                        if not line.startswith("data:"):
+                            continue
+                        line = line[5:].strip()
+                        if line == "[DONE]":
+                            break
+                    if not line:
                         continue
-                    line = line[5:].strip()
-                    if line == "[DONE]":
-                        break
-                if not line:
-                    continue
-                ev = json.loads(line)
-                if ev.get("error"):
-                    raise RuntimeError(str(ev["error"]))
-                if self.native:
-                    piece = (ev.get("message") or {}).get("content") or ""
-                    used = ev.get("prompt_eval_count", used)
-                else:
-                    piece = "".join((c.get("delta") or {}).get("content") or "" for c in ev.get("choices") or [])
-                    used = (ev.get("usage") or {}).get("prompt_tokens", used)
-                if piece:
-                    print(piece, end="", flush=True)
-                    text.append(piece)
-                    # closing the connection stops generation; cost: no server prompt count for this reply
-                    if ("`" in piece or ">" in piece) and call_complete("".join(text)):
-                        break
-        print(flush=True)
+                    ev = json.loads(line)
+                    if ev.get("error"):
+                        raise RuntimeError(str(ev["error"]))
+                    if self.native:
+                        piece = (ev.get("message") or {}).get("content") or ""
+                        used = ev.get("prompt_eval_count", used)
+                    else:
+                        piece = "".join((c.get("delta") or {}).get("content") or "" for c in ev.get("choices") or [])
+                        used = (ev.get("usage") or {}).get("prompt_tokens", used)
+                    if piece:
+                        md.feed(piece)
+                        text.append(piece)
+                        # closing the connection stops generation; cost: no server prompt count for this reply
+                        if ("`" in piece or ">" in piece) and call_complete("".join(text)):
+                            break
+        finally:  # also on Ctrl+C, so styles never leak into the prompt
+            md.close()
         return "".join(text), used
 
     def ask_model(self):
@@ -397,15 +572,11 @@ class Agent:
         """Ask y/n/a before a tool that changes things; 'a' allows that tool for the session."""
         if name not in ASK or name in self.allowed:
             return True
-        if name == "shell":
-            dim(f"[shell] {show(args['command'])}")
-        elif name == "write":
-            dim(f"[write] {show(args['path'])} ({len(str(args['content']).splitlines())} lines)")
-        else:
-            dim(f"[edit] {show(args['path'])}\n" + "\n".join(f"- {show(s)}" for s in str(args["old"]).splitlines()) + "\n"
-                + "\n".join(f"+ {show(s)}" for s in str(args["new"]).splitlines()))
+        if name == "edit":  # shell and write are fully described by the summary line above
+            print("\n".join([paint(f"    - {show(s)}", "red") for s in str(args["old"]).splitlines()]
+                            + [paint(f"    + {show(s)}", "green") for s in str(args["new"]).splitlines()]), flush=True)
         try:
-            ans = input(f"allow {name}? [y/n/a] ").strip().lower()
+            ans = input(paint(f"  allow {name}? [y/n/a] ", "bold")).strip().lower()
         except EOFError:
             ans = "n"
         if ans == "a":
@@ -425,9 +596,9 @@ class Agent:
             except ValueError as e:
                 self.history.append({"role": "assistant", "content": reply})
                 if corrected:
-                    dim(f"[model sent a malformed tool call again ({e}); stopping this turn]")
+                    self.md.status(paint(f"[model sent a malformed tool call again ({e}); stopping this turn]", "dim"))
                     return
-                dim(f"[malformed tool call: {e}; asking the model to retry]")
+                self.md.status(paint(f"[malformed tool call: {e}; asking the model to retry]", "dim"))
                 self.history.append({"role": "user", "content": CORRECTION.format(err=e), "tool": True})
                 corrected = True
                 continue
@@ -436,6 +607,7 @@ class Agent:
                 return
             name, args, end = call
             self.history.append({"role": "assistant", "content": reply[:end]})  # drop anything invented after the call
+            self.md.status(f"{paint('●', 'green')} {paint(name, 'bold')} {show(call_summary(name, args))}")
             if step == self.max_steps:
                 break
             key = json.dumps([name, args], sort_keys=True, default=str)
@@ -451,8 +623,9 @@ class Agent:
                 result = TOOLS[name](args)
             except Exception as e:  # tool errors go back to the model so it can fix its call
                 result = f"error: {e}"
-            lines = result.splitlines()
-            dim(f"[{name}] " + "\n".join(lines[:8]) + (f"\n... ({len(lines) - 8} more lines)" if len(lines) > 8 else ""))
+            lines = result.splitlines() or ["(no output)"]
+            shown = lines[:8] + [f"... ({len(lines) - 8} more lines)"] * (len(lines) > 8)
+            dim("\n".join(("  └ " if i == 0 else "    ") + s for i, s in enumerate(shown)))
             cap = max(400, int(self.max_prompt * self.ratio / 4))  # one result may use about 1/4 of the prompt budget
             self.history.append({"role": "user", "content": f"[{name} result]\n{cut(result, cap)}\n{NUDGE}", "tool": True})
         dim(f"[stopped: {self.max_steps} tool steps in one turn]")
@@ -503,6 +676,9 @@ class Agent:
                 except ValueError as e:
                     dim(f"[error: {e}]")
             dim(f"[temperature {self.temperature}, max-steps {self.max_steps}]")
+        elif cmd == "/verbose":
+            self.verbose = not self.verbose
+            dim(f"[verbose {'on: raw tool-call blocks are shown' if self.verbose else 'off: tool calls show as one line'}]")
         elif cmd == "/tokens":
             self.tokens()
         else:
@@ -522,7 +698,7 @@ def enable_color():
 
 
 def main():
-    global DIM, RESET
+    global COLOR
     for s in (sys.stdin, sys.stdout, sys.stderr):
         s.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="Terminal coding agent for small local models (OpenAI-compatible or Ollama).")
@@ -536,11 +712,12 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1024, help="reply token cap (default %(default)s)")
     ap.add_argument("--temperature", type=float, default=0.2, help="sampling temperature, 0 to 2 (default %(default)s)")
     ap.add_argument("--max-steps", type=int, default=10, help="tool-call cap per user turn (default %(default)s)")
+    ap.add_argument("--verbose", action="store_true", help="show raw tool-call blocks (toggle with /verbose)")
     args = ap.parse_args()
-    if enable_color():
-        DIM, RESET = "\033[2m", "\033[0m"
+    COLOR = enable_color()
     try:
-        agent = Agent(args.url, args.model, args.ctx, args.max_prompt, args.max_tokens, args.temperature, args.max_steps)
+        agent = Agent(args.url, args.model, args.ctx, args.max_prompt, args.max_tokens, args.temperature,
+                      args.max_steps, args.verbose)
     except ValueError as e:
         sys.exit(f"error: {e}")
     dim(f"localcode | {agent.model} @ {agent.url} | {'ollama native' if agent.native else 'openai-compatible'} | "

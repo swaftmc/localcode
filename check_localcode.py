@@ -1,9 +1,11 @@
-"""Assert-based checks for trimming, tool-call parsing, the turn loop, path confinement and edit; exits non-zero on failure."""
+"""Assert-based checks for trimming, tool-call parsing, rendering, the turn loop, confinement and edit; exits non-zero on failure."""
+import re
 import tempfile
 from pathlib import Path
 
 import localcode
-from localcode import call_complete, parse_tool_call, show, tool_edit, tool_grep, tool_read, trim
+from localcode import (STY, Markdown, call_complete, call_summary, parse_tool_call, show, tool_edit, tool_grep,
+                       tool_read, trim)
 
 
 def count(msgs):
@@ -105,10 +107,47 @@ assert not call_complete("```shell\ndir\n```"), "prose may follow, which makes i
 assert not call_complete("All done.")
 
 
+def render(text, styled=False, verbose=False):
+    """Feed text to the renderer one char at a time, the hardest streaming case; return (output, renderer)."""
+    out = []
+    md = Markdown(out.append, styled, verbose)
+    for ch in text:
+        md.feed(ch)
+    md.close()
+    return "".join(out), md
+
+
+def plain(s):
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
+
+
+# Unstyled (piped) output is the reply as written, minus a hidden tool block.
+doc = "# Title\n- a **b** `c`\n> quote\n---\n```python\nx = 1\n```\n```json\n{\"a\": 1}\n```\n2*3 = 6\nend"
+assert render(doc)[0] == doc + "\n", render(doc)[0]
+call = '```tool\n{"tool": "write", "path": "a.md", "content": "# X\\n```\\n"}\n```'
+assert render("Sure.\n" + call)[0] == "Sure.\n", render("Sure.\n" + call)[0]
+assert render('```\n{"tool": "ls"}\n```')[0] == "", "a plain fence holding a call is a tool block"
+assert render("Sure.\n" + call, verbose=True)[0] == "Sure.\n" + call + "\n", "verbose shows the raw block"
+
+# Styled output: markers become styles, code gets a gutter, and a hidden call leaves a marker that status() replaces.
+out, _ = render(doc, styled=True)
+assert plain(out) == "Title\n• a b c\n│ quote\n" + "─" * 40 + "\n│ x = 1\n│ {\"a\": 1}\n2*3 = 6\nend\n", plain(out)
+assert STY["bold"] + "b" in out and STY["code"] + "c" in out and STY["head"] + "Title" in out, out
+assert plain(render("```hi```", styled=True)[0]) == "hi\n", "a one-line fence is inline code"
+out, md = render("Sure.\n" + call, styled=True)
+assert plain(out) == "Sure.\n● tool call…\n" and md.marker, plain(out)
+md.status("● write a.md")
+assert md.write.__self__[-1] == "\x1b[1A\x1b[2K● write a.md\n", "status must overwrite the marker line"
+assert render('<tool_call>{"name": "ls", "arguments": {}}</tool_call>', styled=True)[1].marker
+assert call_summary("write", {"path": "a.md", "content": "x"}) == "a.md (1 line)"
+assert call_summary("read", {"path": "a.py", "start": 5}) == "a.py lines 5-end"
+
+
 def agent_with(history, replies):
     """An Agent with no server: ask_model returns the given replies in order."""
     a = localcode.Agent.__new__(localcode.Agent)
     a.history, a.max_steps, a.allowed, a.asked = history, 10, set(), []
+    a.md = Markdown(lambda s: None, False, False)
     replies = iter(replies)
     a.ask_model = lambda: next(replies)
     a.permitted = lambda name, args: a.asked.append(name) and False  # the user says no to everything

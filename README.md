@@ -25,6 +25,7 @@ localcode works in the directory you start it from. File tools can't reach outsi
 | `--max-tokens N` | 1024 | cap on reply length |
 | `--temperature T` | 0.2 | sampling temperature, 0 to 2 |
 | `--max-steps N` | 10 | cap on tool calls per user turn |
+| `--verbose` | off | show the raw tool-call blocks |
 
 If max-prompt plus max-tokens is more than ctx, localcode warns and lowers max-prompt.
 
@@ -40,7 +41,14 @@ The default URL uses `127.0.0.1` rather than `localhost`. On Windows, `localhost
 | `/ctx N`, `/maxprompt N`, `/maxtokens N` | change the token limits mid-session |
 | `/tokens` | estimated size of the full history and of the trimmed prompt actually sent, against each limit |
 | `/temperature T`, `/maxsteps N` | change the temperature or the tool-call cap mid-session |
+| `/verbose` | show or hide the raw tool-call blocks |
 | `/exit` | quit (Ctrl+C at the prompt also quits; during a reply it cancels the turn) |
+
+## Display
+
+Replies are rendered as Markdown while they stream. Supported: headings, `**bold**`, `` `code` ``, bullet lists, block quotes, horizontal rules, and fenced code blocks, which get a `│` left edge. Tables, nested formatting and syntax highlighting aren't supported.
+
+A tool call shows as one line, such as `● write hello.py (1 line)`, with its result indented under it. `/verbose` shows the raw block instead. Colors only appear in a real terminal. Piped output is the reply as the model wrote it, with tool blocks hidden unless verbose is on.
 
 ## Tools
 
