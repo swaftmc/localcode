@@ -13,8 +13,6 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path.cwd().resolve()
-TEMPERATURE = 0.2
-MAX_STEPS = 10          # tool calls per user turn
 SHELL_TIMEOUT = 60      # seconds before a shell command is killed
 OLD_TOOL_KEEP = 400     # chars an old tool output is shortened to when trimming
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
@@ -43,6 +41,8 @@ Either send one ```tool block using a tool from the list, or, if the task is don
 
 NUDGE = "[end of result] If this answers the task, reply to the user in plain text now. Otherwise call the next tool."
 
+DENIED = "The user denied this action. Try a different approach, or ask the user in plain text."
+
 HELP = """/help              show this help
 /clear             forget the conversation
 /model [name]      show or switch the model
@@ -50,6 +50,8 @@ HELP = """/help              show this help
 /maxprompt N       set the prompt token cap per request
 /maxtokens N       set the reply token cap
 /tokens            show estimated prompt size against the limits
+/temperature T     set the sampling temperature (0 to 2)
+/maxsteps N        set the tool-call cap per user turn
 /exit              quit"""
 
 DIM = RESET = ""
@@ -127,6 +129,16 @@ def parse_tool_call(text):
         return "shell", {"command": " && ".join(s.strip() for s in m.group(1).splitlines() if s.strip())}, len(text)
     m = BARE_RE.search(text)  # small models sometimes skip the fence
     return (*_parse_call(m.group()), m.end()) if m else None
+
+
+def call_complete(text):
+    """True once text holds a whole fenced or tagged tool call, so streaming can stop early."""
+    try:
+        call = parse_tool_call(text)
+    except ValueError:  # usually a call that is still streaming
+        return False
+    # a reply that is only a shell block is a call only if nothing follows it, so keep reading those
+    return bool(call) and text[:call[2]].endswith(("```", "</tool_call>")) and not SHELL_ONLY_RE.fullmatch(text)
 
 
 def _parse_call(body):
@@ -271,12 +283,13 @@ def http(url, body=None, timeout=10):
 
 
 class Agent:
-    def __init__(self, url, model, ctx, max_prompt, max_tokens):
+    def __init__(self, url, model, ctx, max_prompt, max_tokens, temperature, max_steps):
         self.url = url.rstrip("/")
         self.base = re.sub(r"/v1$", "", self.url)
         self.native = self.is_ollama()
-        self.ratio, self.last_used, self.allowed = 3.0, None, set()
+        self.ratio, self.last_used, self.last_note, self.allowed = 3.0, None, "", set()
         self.set_limits(ctx, max_tokens, max_prompt)
+        self.set_sampling(temperature, max_steps)
         self.model = model or self.pick_model()
         self.history = [{"role": "system", "content": SYSTEM.format(cwd=ROOT, os=sys.platform, shell=SHELL_NAME)}]
 
@@ -313,6 +326,12 @@ class Agent:
         self.ctx, self.max_tokens, self.max_prompt_set = ctx, max_tokens, max_prompt
         self.max_prompt = max_prompt or room
 
+    def set_sampling(self, temperature, max_steps):
+        """Validate and apply the temperature and the tool-call cap per user turn."""
+        if not 0 <= temperature <= 2 or max_steps < 1:  # 0-2 is the OpenAI range; `not` also rejects NaN
+            raise ValueError("temperature must be 0 to 2 and max-steps at least 1")
+        self.temperature, self.max_steps = temperature, max_steps
+
     def count(self, msgs):
         """Estimate prompt tokens for msgs."""
         # ponytail: chars/ratio estimate (+4 per message for the chat template), corrected after each reply from the
@@ -323,11 +342,11 @@ class Agent:
         """Send msgs, print the reply as it streams, and return (text, server prompt tokens or None)."""
         if self.native:  # Ollama's /v1 ignores num_ctx, so use the native API there
             url, body = self.base + "/api/chat", {"model": self.model, "messages": msgs, "stream": True, "options": {
-                "num_ctx": self.ctx, "num_predict": self.max_tokens, "temperature": TEMPERATURE}}
+                "num_ctx": self.ctx, "num_predict": self.max_tokens, "temperature": self.temperature}}
         else:
             url, body = self.url + "/chat/completions", {
                 "model": self.model, "messages": msgs, "stream": True, "max_tokens": self.max_tokens,
-                "temperature": TEMPERATURE, "stream_options": {"include_usage": True}}
+                "temperature": self.temperature, "stream_options": {"include_usage": True}}
         text, used = [], None
         with http(url, body, timeout=600) as r:
             for raw in r:
@@ -352,19 +371,21 @@ class Agent:
                 if piece:
                     print(piece, end="", flush=True)
                     text.append(piece)
+                    # closing the connection stops generation; cost: no server prompt count for this reply
+                    if ("`" in piece or ">" in piece) and call_complete("".join(text)):
+                        break
         print(flush=True)
         return "".join(text), used
 
     def ask_model(self):
-        """Trim history to the prompt budget, stream one reply and correct the token ratio."""
-        # ponytail: trimming is saved to history, so raising /maxprompt later can't bring dropped turns back.
-        # Upgrade: keep the full history and trim a copy per request (the notice would then repeat each request).
-        self.history, note = trim(self.history, self.max_prompt, self.count)
-        if note:
+        """Send a copy of the history trimmed to the prompt budget, stream one reply and correct the token ratio."""
+        msgs, note = trim(self.history, self.max_prompt, self.count)  # full history stays, so /maxprompt can grow back
+        if note and note != self.last_note:  # print once, not on every tool step
             dim(note)
-        if (est := self.count(self.history)) > self.max_prompt:
+        self.last_note = note
+        if (est := self.count(msgs)) > self.max_prompt:
             dim(f"[warning: prompt ~{est} tokens is still over max-prompt {self.max_prompt}]")
-        msgs = [{"role": m["role"], "content": m["content"]} for m in self.history]
+        msgs = [{"role": m["role"], "content": m["content"]} for m in msgs]
         text, used = self.stream(msgs)
         if used and used > 4 * len(msgs):  # 0.9 keeps the estimate on the high side
             chars = sum(len(m["content"]) for m in msgs)
@@ -396,8 +417,8 @@ class Agent:
         if self.history[-1]["role"] == "user":  # left by a denial, interrupt or server error; strict templates need alternation
             user_text = self.history.pop()["content"] + "\n\n" + user_text
         self.history.append({"role": "user", "content": user_text})
-        corrected = False  # one correction per user turn
-        for step in range(MAX_STEPS + 1):
+        corrected, denied = False, set()  # one correction per user turn; calls the user said no to
+        for step in range(self.max_steps + 1):
             reply = self.ask_model()
             try:
                 call = parse_tool_call(reply)
@@ -415,12 +436,17 @@ class Agent:
                 return
             name, args, end = call
             self.history.append({"role": "assistant", "content": reply[:end]})  # drop anything invented after the call
-            if step == MAX_STEPS:
+            if step == self.max_steps:
                 break
-            if not self.permitted(name, args):  # hand control back; small models tend to repeat a denied call
-                self.history.append({"role": "user", "content": f"[{name} result]\nThe user denied this action.", "tool": True})
-                dim(f"[{name} denied; tell the model what to do instead]")
+            key = json.dumps([name, args], sort_keys=True, default=str)
+            if key in denied:  # small models tend to repeat a denied call; don't ask again
+                dim(f"[model repeated a denied {name} call; stopping this turn]")
                 return
+            if not self.permitted(name, args):
+                denied.add(key)
+                self.history.append({"role": "user", "content": f"[{name} result]\n{DENIED}", "tool": True})
+                dim(f"[{name} denied; the model will try something else]")
+                continue
             try:
                 result = TOOLS[name](args)
             except Exception as e:  # tool errors go back to the model so it can fix its call
@@ -429,12 +455,12 @@ class Agent:
             dim(f"[{name}] " + "\n".join(lines[:8]) + (f"\n... ({len(lines) - 8} more lines)" if len(lines) > 8 else ""))
             cap = max(400, int(self.max_prompt * self.ratio / 4))  # one result may use about 1/4 of the prompt budget
             self.history.append({"role": "user", "content": f"[{name} result]\n{cut(result, cap)}\n{NUDGE}", "tool": True})
-        dim(f"[stopped: {MAX_STEPS} tool steps in one turn]")
+        dim(f"[stopped: {self.max_steps} tool steps in one turn]")
 
     def tokens(self):
-        est = self.count(self.history)
-        print(f"prompt ~{est} tokens / max-prompt {self.max_prompt}\n"
-              f"prompt + max-tokens ~{est + self.max_tokens} / ctx {self.ctx} (max-tokens {self.max_tokens})\n"
+        sent = self.count(trim(self.history, self.max_prompt, self.count)[0])
+        print(f"history ~{self.count(self.history)} tokens, sent after trimming ~{sent} / max-prompt {self.max_prompt}\n"
+              f"prompt + max-tokens ~{sent + self.max_tokens} / ctx {self.ctx} (max-tokens {self.max_tokens})\n"
               f"estimate: {self.ratio:.2f} chars/token, last server prompt count: {self.last_used or 'none yet'}\n"
               + ("backend: Ollama native /api/chat, num_ctx sent with every request" if self.native else
                  "backend: OpenAI-compatible; ctx only sets localcode's budget (set the server's context at its start)"))
@@ -469,6 +495,14 @@ class Agent:
                 except ValueError as e:
                     dim(f"[error: {e}]")
             dim(f"[ctx {self.ctx}, max-prompt {self.max_prompt}, max-tokens {self.max_tokens}]")
+        elif cmd in ("/temperature", "/maxsteps"):
+            if arg:
+                try:
+                    self.set_sampling(float(arg), self.max_steps) if cmd == "/temperature" else \
+                        self.set_sampling(self.temperature, int(arg))
+                except ValueError as e:
+                    dim(f"[error: {e}]")
+            dim(f"[temperature {self.temperature}, max-steps {self.max_steps}]")
         elif cmd == "/tokens":
             self.tokens()
         else:
@@ -492,22 +526,26 @@ def main():
     for s in (sys.stdin, sys.stdout, sys.stderr):
         s.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="Terminal coding agent for small local models (OpenAI-compatible or Ollama).")
-    ap.add_argument("--url", default=os.environ.get("LOCALCODE_URL", "http://localhost:11434/v1"),
+    # 127.0.0.1, not localhost: on Windows localhost tries IPv6 first and Ollama listens on IPv4 only (~2.3 s per request)
+    ap.add_argument("--url", default=os.environ.get("LOCALCODE_URL", "http://127.0.0.1:11434/v1"),
                     help="OpenAI-compatible base URL (env LOCALCODE_URL, default %(default)s)")
     ap.add_argument("--model", default=os.environ.get("LOCALCODE_MODEL"),
                     help="model name (env LOCALCODE_MODEL; default: first from /v1/models)")
     ap.add_argument("--ctx", type=int, default=8192, help="model context window in tokens (default %(default)s)")
     ap.add_argument("--max-prompt", type=int, help="prompt token cap per request (default ctx minus max-tokens)")
     ap.add_argument("--max-tokens", type=int, default=1024, help="reply token cap (default %(default)s)")
+    ap.add_argument("--temperature", type=float, default=0.2, help="sampling temperature, 0 to 2 (default %(default)s)")
+    ap.add_argument("--max-steps", type=int, default=10, help="tool-call cap per user turn (default %(default)s)")
     args = ap.parse_args()
     if enable_color():
         DIM, RESET = "\033[2m", "\033[0m"
     try:
-        agent = Agent(args.url, args.model, args.ctx, args.max_prompt, args.max_tokens)
+        agent = Agent(args.url, args.model, args.ctx, args.max_prompt, args.max_tokens, args.temperature, args.max_steps)
     except ValueError as e:
         sys.exit(f"error: {e}")
     dim(f"localcode | {agent.model} @ {agent.url} | {'ollama native' if agent.native else 'openai-compatible'} | "
-        f"ctx {agent.ctx}, max-prompt {agent.max_prompt}, max-tokens {agent.max_tokens} | /help")
+        f"ctx {agent.ctx}, max-prompt {agent.max_prompt}, max-tokens {agent.max_tokens} | "
+        f"temperature {agent.temperature}, max-steps {agent.max_steps} | /help")
     while True:
         try:
             line = input("> ")

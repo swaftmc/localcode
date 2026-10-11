@@ -18,13 +18,17 @@ localcode works in the directory you start it from. File tools can't reach outsi
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--url URL` | `$LOCALCODE_URL` or `http://localhost:11434/v1` | OpenAI-compatible base URL |
+| `--url URL` | `$LOCALCODE_URL` or `http://127.0.0.1:11434/v1` | OpenAI-compatible base URL |
 | `--model NAME` | `$LOCALCODE_MODEL` or the first entry of `GET /v1/models` | model to use |
 | `--ctx N` | 8192 | model context window in tokens |
 | `--max-prompt N` | ctx minus max-tokens | cap on prompt tokens per request |
 | `--max-tokens N` | 1024 | cap on reply length |
+| `--temperature T` | 0.2 | sampling temperature, 0 to 2 |
+| `--max-steps N` | 10 | cap on tool calls per user turn |
 
 If max-prompt plus max-tokens is more than ctx, localcode warns and lowers max-prompt.
+
+The default URL uses `127.0.0.1` rather than `localhost`. On Windows, `localhost` tries IPv6 first, and Ollama listens on IPv4 only, which adds about 2 s to every request.
 
 ## Slash commands
 
@@ -34,7 +38,8 @@ If max-prompt plus max-tokens is more than ctx, localcode warns and lowers max-p
 | `/clear` | forget the conversation |
 | `/model [name]` | show available models, or switch |
 | `/ctx N`, `/maxprompt N`, `/maxtokens N` | change the token limits mid-session |
-| `/tokens` | estimated prompt size against each limit |
+| `/tokens` | estimated size of the full history and of the trimmed prompt actually sent, against each limit |
+| `/temperature T`, `/maxsteps N` | change the temperature or the tool-call cap mid-session |
 | `/exit` | quit (Ctrl+C at the prompt also quits; during a reply it cancels the turn) |
 
 ## Tools
@@ -48,11 +53,13 @@ The model calls tools by writing a fenced block:
 ````
 
 Tools: `read` (200 lines by default, `start`/`end` for ranges), `write`, `edit` (exact text, must match once), `ls`, `grep`, `shell` (cmd.exe on Windows, /bin/sh elsewhere, killed after 60 s, no stdin).
-`write`, `edit` and `shell` ask `allow? [y/n/a]` first. `a` allows that tool for the rest of the session. Answering `n` ends the turn so you can say what to do instead.
+`write`, `edit` and `shell` ask `allow? [y/n/a]` first. `a` allows that tool for the rest of the session. Answering `n` tells the model you said no, and it can try something else. If it sends the exact same call again, the turn ends without asking you again.
+
+Reading a reply stops as soon as a tool call's closing fence arrives. That saves the time a small model would spend writing text after the call. Those replies come back without a server token count, so the token estimate is corrected only from plain-text replies.
 
 ## Context handling
 
-Before each request localcode fits the history under max-prompt. It shortens old tool outputs first, then drops the oldest turns. The system prompt and your latest message always stay. A dim `[trimmed: ...]` line shows when this happens. Dropped messages are gone for the rest of the session.
+Before each request localcode fits a copy of the history under max-prompt. It shortens old tool outputs first, then drops the oldest turns. The system prompt and your latest message always stay. A dim `[trimmed: ...]` line shows when the trimming result changes. The full history is kept, so raising `/maxprompt` later sends the older turns again.
 
 Token counts are estimated from character count, then corrected after each reply using the count the server reports.
 
@@ -80,4 +87,4 @@ llama.cpp fixes the context size when the server starts (`-c`). Here `--ctx` and
 python check_localcode.py
 ```
 
-Asserts the trimming and tool-call parsing logic; exits non-zero on failure.
+Asserts the trimming, tool-call parsing, early stop, denial handling, path confinement and edit logic; exits non-zero on failure.

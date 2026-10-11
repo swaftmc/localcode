@@ -1,9 +1,9 @@
-"""Assert-based checks for trimming, tool-call parsing, path confinement and edit; exits non-zero on failure."""
+"""Assert-based checks for trimming, tool-call parsing, the turn loop, path confinement and edit; exits non-zero on failure."""
 import tempfile
 from pathlib import Path
 
 import localcode
-from localcode import parse_tool_call, show, tool_edit, tool_grep, tool_read, trim
+from localcode import call_complete, parse_tool_call, show, tool_edit, tool_grep, tool_read, trim
 
 
 def count(msgs):
@@ -96,13 +96,65 @@ with tempfile.TemporaryDirectory() as tmp:
     except OSError:
         print("note: symlink check skipped (needs Developer Mode or admin on Windows)")
 
+# Early stop: only once a fenced or tagged call is closed; a reply that is only a shell block keeps streaming.
+assert not call_complete('```tool\n{"tool": "write", "path": "a.md", "content": "# X\\n```')
+assert not call_complete('```tool\n{"tool": "ls"}\n')
+assert call_complete('```tool\n{"tool": "ls"}\n```')
+assert call_complete('<tool_call>{"name": "ls", "arguments": {}}</tool_call>')
+assert not call_complete("```shell\ndir\n```"), "prose may follow, which makes it an example"
+assert not call_complete("All done.")
+
+
+def agent_with(history, replies):
+    """An Agent with no server: ask_model returns the given replies in order."""
+    a = localcode.Agent.__new__(localcode.Agent)
+    a.history, a.max_steps, a.allowed, a.asked = history, 10, set(), []
+    replies = iter(replies)
+    a.ask_model = lambda: next(replies)
+    a.permitted = lambda name, args: a.asked.append(name) and False  # the user says no to everything
+    return a
+
+
 # A user message left unanswered (denial, interrupt, server error) is merged so roles keep alternating.
-agent = localcode.Agent.__new__(localcode.Agent)
-agent.history = [system, {"role": "user", "content": "[write result]\nThe user denied this action.", "tool": True}]
-agent.ask_model = lambda: "done"
+agent = agent_with([system, {"role": "user", "content": "[write result]\ndenied", "tool": True}], ["done"])
 agent.turn("do something else")
 assert [m["role"] for m in agent.history] == ["system", "user", "assistant"], agent.history
 assert not agent.history[1].get("tool") and agent.history[1]["content"].endswith("do something else")
+
+# A denied call goes back to the model, which may try something else; repeating the same call ends the turn.
+write = '```tool\n{"tool": "write", "path": "a.py", "content": "x"}\n```'
+agent = agent_with([system], [write, "OK, I won't write it."])
+agent.turn("make a.py")
+assert agent.asked == ["write"] and agent.history[-1]["content"] == "OK, I won't write it.", agent.history
+assert localcode.DENIED in agent.history[-2]["content"], agent.history
+agent = agent_with([system], [write, write, "never reached"])
+agent.turn("make a.py")
+assert agent.asked == ["write"], "a repeated denied call must not ask again"
+assert [m["role"] for m in agent.history] == ["system", "user", "assistant", "user", "assistant"], agent.history
+
+# Trimming applies to the copy sent, so the full history survives and a bigger budget brings it back.
+agent = localcode.Agent.__new__(localcode.Agent)
+agent.history = [system, *turn(1, 4000), *turn(2, 4000), latest]
+agent.ratio, agent.last_note, agent.last_used, agent.max_prompt, sent = 4.0, "", None, 300, []
+agent.stream = lambda msgs: (sent.append(msgs), ("answer", None))[1]
+full = [dict(m) for m in agent.history]
+agent.ask_model()
+assert agent.history == full, "the stored history must not be trimmed"
+assert len(sent[0]) < len(full) and agent.count(sent[0]) <= 300, len(sent[0])
+agent.max_prompt = 100_000
+agent.ask_model()
+assert len(sent[1]) == len(full), "raising max-prompt must send the whole history again"
+
+# Temperature and max-steps are validated.
+for t, s in [(-0.1, 10), (2.5, 10), (float("nan"), 10), (0.2, 0)]:
+    try:
+        agent.set_sampling(t, s)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"accepted temperature {t}, max-steps {s}")
+agent.set_sampling(0.7, 3)
+assert (agent.temperature, agent.max_steps) == (0.7, 3)
 
 # Missing: plain answers and ordinary code blocks are not tool calls.
 assert parse_tool_call("All done, the file is fixed.") is None
