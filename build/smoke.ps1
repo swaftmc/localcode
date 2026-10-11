@@ -71,14 +71,15 @@ try {
             CheckLauncher "$dir\localcode.exe"
         } finally {
             if (Test-Path "$dir\unins000.exe") { Start-Process "$dir\unins000.exe" '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -Wait }
-            # the uninstaller finishes in a copy of itself that outlives the process we waited for
-            for ($i = 0; $i -lt 30 -and (Test-Path "$dir\localcode.exe"); $i++) { Start-Sleep -Milliseconds 500 }
-            Start-Sleep -Seconds 1
+            # The uninstaller carries on in a copy of itself after the process we waited for exits: it deletes the files,
+            # then edits PATH, and removes unins000.exe last. So wait for that file to go.
+            for ($i = 0; $i -lt 120 -and (Test-Path "$dir\unins000.exe"); $i++) { Start-Sleep -Milliseconds 500 }
         }
         $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
         $after = $key.GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
         $afterKind = if ($null -ne $after) { $key.GetValueKind('Path') } else { $null }; $key.Close()
         Check ($after -ceq $before) 'uninstall restores the user PATH exactly'
+        if ($after -cne $before) { "     before: [$before] ($kind)`n     during: [$during]`n     after:  [$after] ($afterKind)" }
         if ($after -ceq $before -and $null -ne $before) { Check ($afterKind -eq $kind) "the PATH value type is unchanged ($kind)" }
         Check (-not (Test-Path "$dir\localcode.exe")) 'uninstall removes the files'
     }
