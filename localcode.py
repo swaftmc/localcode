@@ -1,6 +1,7 @@
 """localcode: a terminal coding agent tuned for small, locally hosted models."""
 import argparse
 import ast
+import ctypes
 import json
 import os
 import re
@@ -59,6 +60,11 @@ def dim(text):
     print(f"{DIM}{text}{RESET}", flush=True)
 
 
+def show(text):
+    """Escape control characters (keeping newlines and tabs) so a permission prompt shows what will really run."""
+    return "".join(c if c in "\n\t" or c.isprintable() else repr(c)[1:-1] for c in str(text))
+
+
 def cut(text, limit):
     """Keep the head and tail of text within about limit chars, marking the cut."""
     if len(text) <= limit:
@@ -96,14 +102,26 @@ BLOCK_RE = re.compile(r"```[ \t]*(\w*)[ \t]*\n?(.*?)(?:```|\Z)|<tool_call>(.*?)(
 LOOKS_LIKE_CALL = re.compile(r"""\s*\{\s*["']?(tool|name)["']?\s*:""")
 SHELL_ONLY_RE = re.compile(r"\s*```[ \t]*(?:shell|bash|sh|cmd|bat|powershell|console)[ \t]*\n(.*?)```\s*", re.S | re.I)
 BARE_RE = re.compile(r"""^[ \t]*\{\s*"tool"\s*:.*\}[ \t]*$""", re.M)
+DECODER = json.JSONDecoder(strict=False)  # strict=False allows raw newlines inside strings
 
 
 def parse_tool_call(text):
     """Return (name, args, end) for the first tool call in text, or None; raise ValueError if it is malformed."""
     for m in BLOCK_RE.finditer(text):
-        lang, body = ("tool", m.group(3)) if m.group(3) is not None else (m.group(1).lower(), m.group(2))
+        tag = m.group(3) is not None
+        lang, body = ("tool", m.group(3)) if tag else (m.group(1).lower(), m.group(2))
         if lang == "tool" or (lang in ("", "json") and LOOKS_LIKE_CALL.match(body)):
-            return (*_parse_call(body), m.end())
+            start = text.find("{", m.start(3 if tag else 2), m.end())
+            try:  # decode from the brace so a ``` inside a JSON string doesn't end the block
+                obj, j = DECODER.raw_decode(text, start) if start != -1 else (None, -1)
+            except ValueError:
+                obj = None
+            if not isinstance(obj, dict):
+                return (*_parse_call(body), m.end())
+            close = "</tool_call>" if tag else "```"
+            k = text.find(close, j)
+            end = k + len(close) if k != -1 and not text[j:k].strip() else j
+            return (*_check_call(obj), end)
     m = SHELL_ONLY_RE.fullmatch(text)  # a reply that is only a shell block means "run this"
     if m and m.group(1).strip():
         return "shell", {"command": " && ".join(s.strip() for s in m.group(1).splitlines() if s.strip())}, len(text)
@@ -123,6 +141,11 @@ def _parse_call(body):
             obj = ast.literal_eval(s)  # single quotes, trailing commas
         except Exception:
             raise ValueError(f"bad JSON ({e})") from None
+    return _check_call(obj)
+
+
+def _check_call(obj):
+    """Validate a decoded tool call object and return (name, args)."""
     if not isinstance(obj, dict):
         raise ValueError("the tool block must hold one JSON object")
     name = obj.get("tool") or obj.get("name")
@@ -198,6 +221,8 @@ def tool_grep(a):
         dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS)
         for name in sorted(names):
             f = Path(d, name)
+            if not f.resolve().is_relative_to(ROOT):
+                continue  # a symlink pointing outside the working directory
             try:
                 if f.stat().st_size > 1_000_000:
                     continue
@@ -210,10 +235,19 @@ def tool_grep(a):
     return "\n".join(out) or "no matches"
 
 
+def decode_output(b):
+    """Decode shell output as UTF-8 when valid, else as the Windows console code page that cmd.exe built-ins use."""
+    # ponytail: one guess per command, so mixed UTF-8 and code-page output gets the code page. Upgrade: per-line decode.
+    try:
+        return b.decode("utf-8").replace("\r\n", "\n")
+    except UnicodeDecodeError:
+        cp = ctypes.windll.kernel32.GetConsoleOutputCP() if os.name == "nt" else 0
+        return b.decode(f"cp{cp}" if cp else ("oem" if os.name == "nt" else "latin-1"), "replace").replace("\r\n", "\n")
+
+
 def tool_shell(a):
     p = subprocess.Popen(str(a["command"]), shell=True, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                         start_new_session=os.name != "nt")
+                         stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
     try:
         out, _ = p.communicate(timeout=SHELL_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -222,8 +256,8 @@ def tool_shell(a):
         else:
             os.killpg(p.pid, signal.SIGKILL)
         out, _ = p.communicate()
-        return f"{out}\n[killed after {SHELL_TIMEOUT}s timeout; interactive commands are not supported]"
-    return f"{out}\n[exit code {p.returncode}]"
+        return f"{decode_output(out)}\n[killed after {SHELL_TIMEOUT}s timeout; interactive commands are not supported]"
+    return f"{decode_output(out)}\n[exit code {p.returncode}]"
 
 
 TOOLS = {"read": tool_read, "write": tool_write, "edit": tool_edit, "ls": tool_ls, "grep": tool_grep, "shell": tool_shell}
@@ -323,6 +357,8 @@ class Agent:
 
     def ask_model(self):
         """Trim history to the prompt budget, stream one reply and correct the token ratio."""
+        # ponytail: trimming is saved to history, so raising /maxprompt later can't bring dropped turns back.
+        # Upgrade: keep the full history and trim a copy per request (the notice would then repeat each request).
         self.history, note = trim(self.history, self.max_prompt, self.count)
         if note:
             dim(note)
@@ -341,12 +377,12 @@ class Agent:
         if name not in ASK or name in self.allowed:
             return True
         if name == "shell":
-            dim(f"[shell] {args['command']}")
+            dim(f"[shell] {show(args['command'])}")
         elif name == "write":
-            dim(f"[write] {args['path']} ({len(str(args['content']).splitlines())} lines)")
+            dim(f"[write] {show(args['path'])} ({len(str(args['content']).splitlines())} lines)")
         else:
-            dim(f"[edit] {args['path']}\n" + "\n".join(f"- {s}" for s in str(args["old"]).splitlines()) + "\n"
-                + "\n".join(f"+ {s}" for s in str(args["new"]).splitlines()))
+            dim(f"[edit] {show(args['path'])}\n" + "\n".join(f"- {show(s)}" for s in str(args["old"]).splitlines()) + "\n"
+                + "\n".join(f"+ {show(s)}" for s in str(args["new"]).splitlines()))
         try:
             ans = input(f"allow {name}? [y/n/a] ").strip().lower()
         except EOFError:
@@ -357,6 +393,8 @@ class Agent:
 
     def turn(self, user_text):
         """Run one user turn: model reply, tool call, result back, until a reply has no tool call."""
+        if self.history[-1]["role"] == "user":  # left by a denial, interrupt or server error; strict templates need alternation
+            user_text = self.history.pop()["content"] + "\n\n" + user_text
         self.history.append({"role": "user", "content": user_text})
         corrected = False  # one correction per user turn
         for step in range(MAX_STEPS + 1):
@@ -444,7 +482,6 @@ def enable_color():
         return False
     if os.name != "nt":
         return True
-    import ctypes
     k = ctypes.windll.kernel32
     h, mode = k.GetStdHandle(-11), ctypes.c_uint32()
     return bool(k.GetConsoleMode(h, ctypes.byref(mode)) and k.SetConsoleMode(h, mode.value | 4))

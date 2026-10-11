@@ -1,5 +1,9 @@
-"""Assert-based checks for history trimming and tool-call parsing; exits non-zero on failure."""
-from localcode import parse_tool_call, trim
+"""Assert-based checks for trimming, tool-call parsing, path confinement and edit; exits non-zero on failure."""
+import tempfile
+from pathlib import Path
+
+import localcode
+from localcode import parse_tool_call, show, tool_edit, tool_grep, tool_read, trim
 
 
 def count(msgs):
@@ -54,6 +58,51 @@ assert parse_tool_call("```shell\npython --version\n```\n")[:2] == ("shell", {"c
 assert parse_tool_call("Run this:\n```bash\npip install x\n```") is None, "shell blocks inside prose are examples"
 text = 'a\n```tool\n{"tool": "ls"}\n```\n[ls result]\ninvented'
 assert text[:parse_tool_call(text)[2]].endswith("```"), "end must point just past the tool block"
+
+# A code fence inside a JSON string (writing Markdown) must not end the tool block.
+md = "# X\n```\nrun\n```\n"
+text = '```tool\n{"tool": "write", "path": "README.md", "content": "# X\\n```\\nrun\\n```\\n"}\n```\nafter'
+name, args, end = parse_tool_call(text)
+assert (name, args) == ("write", {"path": "README.md", "content": md}), args
+assert text[:end].endswith("}\n```"), text[:end]
+text = '<tool_call>{"name": "edit", "arguments": {"path": "a.md", "old": "```py", "new": "```python"}}</tool_call>'
+assert parse_tool_call(text)[:2] == ("edit", {"path": "a.md", "old": "```py", "new": "```python"})
+assert parse_tool_call(text)[2] == len(text)
+
+# Permission prompts escape control characters so the user sees the real command.
+assert show("dir\r\x1b[2Kecho ok\nnext\t1") == "dir\\r\\x1b[2Kecho ok\nnext\t1", show("dir\r\x1b[2Kecho ok\nnext\t1")
+
+# File tools stay inside the working directory; edit fails clearly on 0 or 2+ matches and keeps CRLF.
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp, "proj")
+    root.mkdir()
+    Path(tmp, "outside.txt").write_text("secret\n")
+    (root / "a.txt").write_bytes(b"x = 1\r\ny = 2\r\nx = 1\r\n")
+    localcode.ROOT = root.resolve()
+    for call, why in [(lambda: tool_read({"path": "../outside.txt"}), "outside the working directory"),
+                      (lambda: tool_edit({"path": "a.txt", "old": "z", "new": "w"}), "not found"),
+                      (lambda: tool_edit({"path": "a.txt", "old": "x = 1", "new": "w"}), "matches 2 times")]:
+        try:
+            call()
+        except ValueError as e:
+            assert why in str(e), e
+        else:
+            raise AssertionError(f"expected error: {why}")
+    assert tool_edit({"path": "a.txt", "old": "y = 2", "new": "y = 3"}) == "edited a.txt"
+    assert (root / "a.txt").read_bytes() == b"x = 1\r\ny = 3\r\nx = 1\r\n"
+    try:
+        (root / "link.txt").symlink_to(Path(tmp, "outside.txt"))
+        assert tool_grep({"pattern": "secret"}) == "no matches", "grep must skip symlinks leading outside"
+    except OSError:
+        print("note: symlink check skipped (needs Developer Mode or admin on Windows)")
+
+# A user message left unanswered (denial, interrupt, server error) is merged so roles keep alternating.
+agent = localcode.Agent.__new__(localcode.Agent)
+agent.history = [system, {"role": "user", "content": "[write result]\nThe user denied this action.", "tool": True}]
+agent.ask_model = lambda: "done"
+agent.turn("do something else")
+assert [m["role"] for m in agent.history] == ["system", "user", "assistant"], agent.history
+assert not agent.history[1].get("tool") and agent.history[1]["content"].endswith("do something else")
 
 # Missing: plain answers and ordinary code blocks are not tool calls.
 assert parse_tool_call("All done, the file is fixed.") is None
