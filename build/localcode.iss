@@ -37,13 +37,17 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  P: string;
+  P, Dir: string;
 begin
   if CurStep <> ssPostInstall then Exit;
   if not RegQueryStringValue(HKCU, EnvKey, 'Path', P) then P := '';
-  if Pos(Wrap(Uppercase(ExpandConstant('{app}'))), Uppercase(Wrap(P))) > 0 then Exit;
-  if (P <> '') and (P[Length(P)] <> ';') then P := P + ';';
-  RegWriteExpandStringValue(HKCU, EnvKey, 'Path', P + ExpandConstant('{app}'));
+  Dir := ExpandConstant('{app}');
+  if Pos(Wrap(Uppercase(Dir)), Uppercase(Wrap(P))) > 0 then Exit;
+  // Keep a trailing ';' as the user had it, so uninstalling (which removes ';Dir') restores the value exactly.
+  if P = '' then P := Dir
+  else if P[Length(P)] = ';' then P := P + Dir + ';'
+  else P := P + ';' + Dir;
+  RegWriteExpandStringValue(HKCU, EnvKey, 'Path', P);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
