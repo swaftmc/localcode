@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 ROOT = Path.cwd().resolve()
 SHELL_TIMEOUT = 60      # seconds before a shell command is killed
 OLD_TOOL_KEEP = 400     # chars an old tool output is shortened to when trimming

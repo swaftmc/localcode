@@ -22,6 +22,10 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 
+[Messages]
+; Windows gives a PATH change only to programs started afterwards, so terminals that were already open can't see it.
+FinishedLabelNoIcons=Setup has installed [name] and added it to your PATH.%n%nOpen a NEW terminal window to use the localcode command. A terminal that was already open keeps the old PATH, and so does one inside an editor such as VS Code or Kiro until you restart the editor.
+
 [Files]
 Source: "stage\localcode\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 

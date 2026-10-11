@@ -13,6 +13,12 @@ localcode talks to a model server you already run locally, such as Ollama, llama
 | Linux x86_64 | `localcode-<version>-linux-x64.tar.gz` | `tar -xzf` it, then run `localcode/localcode`. To use it from anywhere: `ln -s "$PWD/localcode/localcode" ~/.local/bin/localcode`. |
 | Linux ARM64 | `localcode-<version>-linux-arm64.tar.gz` | The same as x86_64. |
 
+**After the Windows installer, open a new terminal.** Windows gives a PATH change only to programs started afterwards, so a terminal that was already open keeps the old PATH and says `localcode` "is not recognized as the name of a cmdlet". A terminal inside an editor such as VS Code or Kiro needs the editor restarted. To use it without reopening anything, paste this into PowerShell:
+
+```
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+```
+
 The Linux builds need glibc 2.17 or newer (most distributions from 2014 on). Alpine and other musl-based systems aren't supported. The Windows files aren't code-signed, so SmartScreen may ask you to click "More info" and then "Run anyway". Check a download against `SHA256SUMS.txt` from the release if you like.
 
 Then, from the folder you want to work in:
