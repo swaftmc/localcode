@@ -76,7 +76,7 @@ A tool call shows as one line, such as `● write hello.py (1 line)`, with its r
 localcode works with any model your server runs, and the model matters more than any setting. In testing on a CPU-only machine:
 
 - **qwen2.5-coder:1.5b** (about 1 GB) is fast and handles one-step requests: listing files, reading one, writing a small page. It loses track on multi-step requests and cannot write a full app. localcode ends its loops with a message, but it cannot make the model smarter.
-- **qwen3.5:4b** (about 3 GB) follows multi-step requests, such as reading files and then writing a summary of them, and writes noticeably better code, but runs about three times slower on a CPU. localcode asks Ollama not to use the model's hidden "thinking" mode, which would spend your `--max-tokens` on text localcode never shows.
+- **qwen3.5:4b** (about 3 GB) follows multi-step requests, such as reading files and then writing a summary of them, and writes noticeably better code, but ran two to three times slower than the 1.5B model on the same CPU. localcode asks Ollama not to use the model's hidden "thinking" mode, which would spend your `--max-tokens` on text localcode never shows.
 
 If a request fails or loops, try a bigger model before changing settings.
 
