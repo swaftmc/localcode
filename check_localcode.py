@@ -1,11 +1,14 @@
 """Assert-based checks for trimming, tool-call parsing, rendering, the turn loop, confinement and edit; exits non-zero on failure."""
 import re
+import sys
 import tempfile
 from pathlib import Path
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # main() does the same; Windows consoles default to cp1252
+
 import localcode
-from localcode import (STY, Markdown, call_complete, call_summary, parse_tool_call, show, tool_edit, tool_grep,
-                       tool_read, trim)
+from localcode import (STY, Markdown, call_complete, call_summary, file_from_reply, parse_tool_call, show, tool_edit,
+                       tool_grep, tool_read, trim)
 
 
 def count(msgs):
@@ -140,17 +143,24 @@ md.status("● write a.md")
 assert md.write.__self__[-1] == "\x1b[1A\x1b[2K● write a.md\n", "status must overwrite the marker line"
 assert render('<tool_call>{"name": "ls", "arguments": {}}</tool_call>', styled=True)[1].marker
 assert call_summary("write", {"path": "a.md", "content": "x"}) == "a.md (1 line)"
+assert call_summary("write", {"path": "a.md"}) == "a.md", "a write call without content has no line count yet"
 assert call_summary("read", {"path": "a.py", "start": 5}) == "a.py lines 5-end"
 
 
-def agent_with(history, replies):
-    """An Agent with no server: ask_model returns the given replies in order."""
+def agent_with(history, replies, allow=False, cut_off=()):
+    """An Agent with no server: ask_model returns the given replies in order (those at cut_off positions are truncated)."""
     a = localcode.Agent.__new__(localcode.Agent)
-    a.history, a.max_steps, a.allowed, a.asked = history, 10, set(), []
+    a.history, a.max_steps, a.allowed, a.asked, a.truncated = history, 10, set(), [], False
+    a.max_prompt, a.ratio, a.max_tokens, a.ctx = 7000, 3.0, 2048, 8192
     a.md = Markdown(lambda s: None, False, False)
-    replies = iter(replies)
-    a.ask_model = lambda: next(replies)
-    a.permitted = lambda name, args: a.asked.append(name) and False  # the user says no to everything
+    replies, count = iter(replies), iter(range(1000))
+
+    def ask(stop_at_call=True):
+        a.truncated = next(count) in cut_off
+        return next(replies)
+
+    a.ask_model = ask
+    a.permitted = lambda name, args, streamed=False: a.asked.append(name) or allow  # allow=False: the user says no
     return a
 
 
@@ -175,7 +185,8 @@ assert [m["role"] for m in agent.history] == ["system", "user", "assistant", "us
 agent = localcode.Agent.__new__(localcode.Agent)
 agent.history = [system, *turn(1, 4000), *turn(2, 4000), latest]
 agent.ratio, agent.last_note, agent.last_used, agent.max_prompt, sent = 4.0, "", None, 300, []
-agent.stream = lambda msgs: (sent.append(msgs), ("answer", None))[1]
+agent.stream = lambda msgs, stop_at_call=True: (sent.append(msgs), ("answer", None))[1]
+agent.max_tokens, agent.ctx = 1024, 8192
 full = [dict(m) for m in agent.history]
 agent.ask_model()
 assert agent.history == full, "the stored history must not be trimmed"
@@ -213,4 +224,157 @@ for bad, why in [('```tool\n{"tool": "read", "path": }\n```', "bad JSON"),
     else:
         raise AssertionError(f"no error for {bad!r}")
 
+# A write call may carry only the path; the file text then arrives in a code block.
+assert parse_tool_call('```tool\n{"tool": "write", "path": "a.py"}\n```')[:2] == ("write", {"path": "a.py"})
+assert file_from_reply("```python\nprint(1)\n```") == "print(1)\n"
+assert file_from_reply("Sure!\n```html\n<p>hi</p>\n```\nThat is the file.") == "<p>hi</p>\n"
+assert file_from_reply("```\nno closing fence\nstill the file") == "no closing fence\nstill the file\n"
+md_file = "# Doc\n```bash\nls\n```\ntext\n"
+assert file_from_reply("```markdown\n" + md_file + "```") == md_file, "a Markdown file holding fences must stay whole"
+assert file_from_reply("here is the code in plain text") is None
+assert file_from_reply("```python\n\n```") is None, "an empty block is not a file"
+
+with tempfile.TemporaryDirectory() as tmp:
+    localcode.ROOT = Path(tmp).resolve()
+    call = '```tool\n{"tool": "write", "path": "page.html"}\n```'
+    body = "```html\n<h1>hi</h1>\n<p>there</p>\n```"
+
+    # Two-step write: call, then the code block, then the model's closing answer. The file holds the real text.
+    agent = agent_with([system], [call, body, "Done."], allow=True)
+    agent.turn("make page.html")
+    assert (Path(tmp) / "page.html").read_text() == "<h1>hi</h1>\n<p>there</p>\n", list(Path(tmp).iterdir())
+    assert [m["role"] for m in agent.history] == ["system", "user", "assistant", "user", "assistant", "user", "assistant"]
+    result = agent.history[-2]["content"]
+    assert result.startswith("[write result]\nwrote 2 lines to page.html"), result
+    assert 'The user asked: "make page.html"' in result, "the reminder after a tool must repeat the user's request"
+
+    # A reply that was cut off at max-tokens is not written, and the model is told why.
+    (Path(tmp) / "page.html").unlink()
+    agent = agent_with([system], [call, body, "I will make it shorter."], allow=True, cut_off={1})
+    agent.turn("make page.html")
+    assert not (Path(tmp) / "page.html").exists(), "a cut-off file must not be written"
+    assert "cut off at the token limit" in agent.history[-2]["content"], agent.history[-2]["content"]
+
+    # A second cut-off file in one turn ends the turn with a plain answer instead of another long attempt.
+    agent = agent_with([system], [call, body, call, body, "The file was too long."], allow=True, cut_off={1, 3})
+    agent.turn("make page.html")  # a fifth ask for another attempt would raise StopIteration
+    assert not (Path(tmp) / "page.html").exists()
+    assert agent.history[-1] == {"role": "assistant", "content": "The file was too long."}, agent.history[-1]
+    assert localcode.FINAL in agent.history[-2]["content"], "the turn must end with the final-answer request"
+    roles = [m["role"] for m in agent.history]
+    assert all(a != b for a, b in zip(roles[1:], roles[2:])), roles  # the roles keep alternating
+
+    # A reply without a code block is not written either.
+    agent = agent_with([system], [call, "Here is the page: it has a heading.", "Sorry."], allow=True)
+    agent.turn("make page.html")
+    assert not (Path(tmp) / "page.html").exists() and "no code block" in agent.history[-2]["content"]
+
+    # The user's answer is asked only once the text is known, and a no leaves nothing behind.
+    agent = agent_with([system], [call, body, "Understood."])
+    agent.turn("make page.html")
+    assert agent.asked == ["write"] and not (Path(tmp) / "page.html").exists()
+
+    # content inside the call still works (short files, older habits).
+    agent = agent_with([system], ['```tool\n{"tool": "write", "path": "b.txt", "content": "hello\\n"}\n```', "Done."], allow=True)
+    agent.turn("make b.txt")
+    assert (Path(tmp) / "b.txt").read_text() == "hello\n"
+
+    # Two calls in one block: the first runs and the model is told the rest did not.
+    (Path(tmp) / "a.txt").write_text("one\n")
+    two = '```tool\n{"tool": "ls", "path": "."}\n{"tool": "read", "path": "a.txt"}\n```'
+    agent = agent_with([system], [two, "Done."], allow=True)
+    agent.turn("list the files, then read a.txt")
+    assert "Only the first ran" in agent.history[-2]["content"], agent.history[-2]["content"]
+    agent = agent_with([system], [call, body, "Done."], allow=True)
+    agent.turn("make page.html")
+    assert "Only the first ran" not in agent.history[3]["content"], "no note when there was only one call"
+
+    # The reminder lists the tools used so far.
+    agent = agent_with([system], ['```tool\n{"tool": "ls", "path": "."}\n```', "Done."], allow=True)
+    agent.turn("list the files")
+    assert "Tools you have used so far: ls." in agent.history[-2]["content"], agent.history[-2]["content"]
+
+    # Repeating the same read-only call is answered with a note instead of running it again; a second repeat ends the turn.
+    rd = '```tool\n{"tool": "read", "path": "a.txt"}\n```'
+    agent = agent_with([system], [rd, rd, rd, "It says one."], allow=True)  # a fifth ask would raise StopIteration
+    agent.turn("read a.txt")
+    assert any(localcode.REPEAT in m["content"] for m in agent.history), "the first repeat must get the note"
+    assert sum("[read result]\n[a.txt lines" in m["content"] for m in agent.history) == 1, "the read must run only once"
+    assert agent.history[-1] == {"role": "assistant", "content": "It says one."}, "the second repeat asks for a final answer"
+    assert localcode.FINAL in agent.history[-2]["content"] and agent.history[-2]["role"] == "user"
+    roles = [m["role"] for m in agent.history]
+    assert all(a != b for a, b in zip(roles[1:], roles[2:])), roles  # the roles keep alternating
+
+    # Hitting the step cap also ends with a plain-text answer, and the capped call does not run.
+    agent = agent_with([system], ['```tool\n{"tool": "ls", "path": "."}\n```', rd, '```tool\n{"tool": "grep", "pattern": "x"}\n```',
+                                  "Two files."], allow=True)
+    agent.max_steps = 2
+    agent.turn("look around")
+    assert agent.history[-1]["content"] == "Two files." and not any("[grep result]" in m["content"] for m in agent.history)
+
+    # Listing again after a shell command is legitimate (it may have created files); an identical command is not.
+    ls_call = '```tool\n{"tool": "ls", "path": "."}\n```'
+    sh = '```tool\n{"tool": "shell", "command": "echo hi"}\n```'
+    agent = agent_with([system], [ls_call, sh, ls_call, "Done."], allow=True)
+    agent.turn("ls, run, ls")
+    assert not any(localcode.REPEAT in m["content"] for m in agent.history), "state changed, so ls is not a repeat"
+
+    # A change in between makes reading again legitimate.
+    wr = '```tool\n{"tool": "write", "path": "c.txt", "content": "x\\n"}\n```'
+    agent = agent_with([system], [rd, wr, rd, "Done."], allow=True)
+    agent.turn("read, write, read")
+    assert sum("[read result]\n[a.txt lines" in m["content"] for m in agent.history) == 2
+    assert not any(localcode.REPEAT in m["content"] for m in agent.history)
+
+    # A tool call cut off by max-tokens is reported as such, not as bad JSON.
+    agent = agent_with([system], ['```tool\n{"tool": "write", "path": "z.py", "content": "def f():\\n  re', "ok"], cut_off={0})
+    agent.turn("make z.py")
+    assert "cut off at the token limit" in agent.history[-2]["content"], agent.history[-2]["content"]
+
+
+
+class FakeResponse:
+    """Stands in for the HTTP response of a streaming chat request: iterating it yields the given byte lines."""
+
+    def __init__(self, lines):
+        self.lines = lines
+
+    def __enter__(self):
+        return iter(self.lines)
+
+    def __exit__(self, *exc):
+        return False
+
+
+def streamer(native):
+    a = localcode.Agent.__new__(localcode.Agent)
+    a.native, a.url, a.base, a.model = native, "http://x/v1", "http://x", "m"
+    a.ctx, a.max_tokens, a.temperature, a.verbose, a.truncated = 4096, 512, 0.2, False, False
+    return a
+
+
+real_http, sent = localcode.http, {}
+try:
+    # Ollama native: thinking is switched off, num_ctx is sent, and done_reason "length" marks a cut-off reply.
+    def ollama_http(url, body=None, timeout=10):
+        sent.update(url=url, body=body)
+        return FakeResponse([b'{"message": {"content": "hel"}, "done": false}\n',
+                             b'{"message": {"content": "lo"}, "done": true, "done_reason": "length", "prompt_eval_count": 50}\n'])
+    localcode.http = ollama_http
+    a = streamer(True)
+    assert a.stream([{"role": "user", "content": "hi"}]) == ("hello", 50) and a.truncated
+    assert sent["url"] == "http://x/api/chat" and sent["body"]["think"] is False and sent["body"]["options"]["num_ctx"] == 4096, sent
+
+    # OpenAI-compatible: finish_reason "length" marks a cut-off reply; "stop" does not.
+    def openai_http(url, body=None, timeout=10, reason="length"):
+        return FakeResponse([b'data: {"choices": [{"delta": {"content": "hi"}, "finish_reason": null}]}\n',
+                             b'data: {"choices": [{"delta": {}, "finish_reason": "%s"}]}\n' % reason.encode(), b"data: [DONE]\n"])
+    localcode.http = openai_http
+    a = streamer(False)
+    assert a.stream([{"role": "user", "content": "hi"}])[0] == "hi" and a.truncated
+    localcode.http = lambda *args, **kw: openai_http(*args, reason="stop", **kw)
+    a = streamer(False)
+    assert a.stream([{"role": "user", "content": "hi"}])[0] == "hi" and not a.truncated
+finally:
+    localcode.http = real_http
 print("all checks passed")

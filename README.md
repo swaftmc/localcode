@@ -43,7 +43,7 @@ Free for noncommercial use under the [PolyForm Noncommercial License 1.0.0](LICE
 | `--model NAME` | `$LOCALCODE_MODEL` or the first entry of `GET /v1/models` | model to use |
 | `--ctx N` | 8192 | model context window in tokens |
 | `--max-prompt N` | ctx minus max-tokens | cap on prompt tokens per request |
-| `--max-tokens N` | 1024 | cap on reply length |
+| `--max-tokens N` | 2048 | cap on reply length. A file longer than this is cut off and not written, so raise it for big files |
 | `--temperature T` | 0.2 | sampling temperature, 0 to 2 |
 | `--max-steps N` | 10 | cap on tool calls per user turn |
 | `--verbose` | off | show the raw tool-call blocks |
@@ -71,6 +71,15 @@ Replies are rendered as Markdown while they stream. Supported: headings, `**bold
 
 A tool call shows as one line, such as `● write hello.py (1 line)`, with its result indented under it. `/verbose` shows the raw block instead. Colors only appear in a real terminal. Piped output is the reply as the model wrote it, with tool blocks hidden unless verbose is on.
 
+## Which model
+
+localcode works with any model your server runs, and the model matters more than any setting. In testing on a CPU-only machine:
+
+- **qwen2.5-coder:1.5b** (about 1 GB) is fast and handles one-step requests: listing files, reading one, writing a small page. It loses track on multi-step requests and cannot write a full app. localcode ends its loops with a message, but it cannot make the model smarter.
+- **qwen3.5:4b** (about 3 GB) follows multi-step requests, such as reading files and then writing a summary of them, and writes noticeably better code, but runs about three times slower on a CPU. localcode asks Ollama not to use the model's hidden "thinking" mode, which would spend your `--max-tokens` on text localcode never shows.
+
+If a request fails or loops, try a bigger model before changing settings.
+
 ## Tools
 
 The model calls tools by writing a fenced block:
@@ -82,6 +91,8 @@ The model calls tools by writing a fenced block:
 ````
 
 Tools: `read` (200 lines by default, `start`/`end` for ranges), `write`, `edit` (exact text, must match once), `ls`, `grep`, `shell` (cmd.exe on Windows, /bin/sh elsewhere, killed after 60 s, no stdin).
+
+`write` takes two steps because small models fail at packing a whole file into one JSON string. The model sends only the path, then localcode asks for the complete file text as an ordinary code block and writes that. You see the code stream in, and the permission question names the file and its line count. A `content` field inside the call still works. If the reply hits `--max-tokens` before the file ends, nothing is written and you are told to raise the limit. After each tool result the model is reminded of your request and asked to continue until every part is done.
 `write`, `edit` and `shell` ask `allow? [y/n/a]` first. `a` allows that tool for the rest of the session. Answering `n` tells the model you said no, and it can try something else. If it sends the exact same call again, the turn ends without asking you again.
 
 Reading a reply stops as soon as a tool call's closing fence arrives. That saves the time a small model would spend writing text after the call. Those replies come back without a server token count, so the token estimate is corrected only from plain-text replies.
@@ -116,4 +127,4 @@ llama.cpp fixes the context size when the server starts (`-c`). Here `--ctx` and
 python check_localcode.py
 ```
 
-Asserts the trimming, tool-call parsing, early stop, denial handling, path confinement and edit logic; exits non-zero on failure.
+Asserts the trimming, tool-call parsing, two-step write, early stop, denial handling, path confinement and edit logic; exits non-zero on failure.

@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 ROOT = Path.cwd().resolve()
 SHELL_TIMEOUT = 60      # seconds before a shell command is killed
 OLD_TOOL_KEEP = 400     # chars an old tool output is shortened to when trimming
@@ -26,13 +26,14 @@ To use a tool, reply with ONE block like this, then stop and wait for the result
 ```
 Tools:
 - read: {{"tool": "read", "path": "a.py", "start": 1, "end": 200}} (start/end optional)
-- write: {{"tool": "write", "path": "a.py", "content": "full file text"}}
+- write: {{"tool": "write", "path": "a.py"}} (you are then asked for the complete file text)
 - edit: {{"tool": "edit", "path": "a.py", "old": "exact text to replace", "new": "new text"}}
 - ls: {{"tool": "ls", "path": "."}}
 - grep: {{"tool": "grep", "pattern": "regex", "path": "."}}
 - shell: {{"tool": "shell", "command": "python --version"}} (runs in {shell})
 Rules:
 - One tool call per reply. Never write the tool result yourself.
+- Always write the complete finished file with all the real code, never a description of it.
 - Read a file before editing it. "old" must match the file text exactly and only once.
 - Paths are relative to the working directory.
 - When the task is done, reply with no tool block: a short Markdown answer saying what you did.
@@ -41,7 +42,25 @@ Rules:
 CORRECTION = """Your tool call was invalid: {err}
 Either send one ```tool block using a tool from the list, or, if the task is done, reply in plain text with no tool block."""
 
-NUDGE = "[end of result] If the task is done, tell the user in one sentence what you did; don't repeat this result. Otherwise call the next tool."
+NUDGE = ('[end of result] The user asked: "{task}"\nTools you have used so far: {used}.\n'
+         "If a part of the request is still undone, call the tool for it now. If every part is done, answer the user "
+         "in one sentence. Never repeat a tool call you already made.")
+
+FINAL = "[stop] Answer the user's request now, in plain text, in one or two sentences. Do not call a tool."
+
+REPEAT = ("[note] You already made this exact call and nothing has changed since. Do not repeat it. "
+          "If the request is done, answer the user in one sentence; otherwise call a different tool.")
+
+ASK_FILE = "[write result]\nSend the complete text of {path} now, inside one code block, with nothing before or after it."
+
+NO_BLOCK = "error: no code block in your reply, so nothing was written. Call write again, then put the complete file in one code block."
+
+CUT_OFF = ("error: your reply was cut off at the token limit, so nothing was written. "
+           "Make the file shorter, or split it into several smaller files.")
+
+CUT_OFF_CALL = "your reply was cut off at the token limit, so the tool call is incomplete. Send a shorter one."
+
+EXTRA_NOTE = "[note] Your reply held more than one tool call. Only the first ran. Send the others one at a time.\n"
 
 DENIED = "The user denied this action. Try a different approach, or ask the user in plain text."
 
@@ -109,11 +128,12 @@ def trim(msgs, budget, count):
     return msgs, f"[trimmed: {', '.join(parts)}]" if parts else ""
 
 
-TOOL_ARGS = {"read": ["path"], "write": ["path", "content"], "edit": ["path", "old", "new"],
+TOOL_ARGS = {"read": ["path"], "write": ["path"], "edit": ["path", "old", "new"],  # write's content is optional
              "ls": [], "grep": ["pattern"], "shell": ["command"]}
 BLOCK_RE = re.compile(r"```[ \t]*(\w*)[ \t]*\n?(.*?)(?:```|\Z)|<tool_call>(.*?)(?:</tool_call>|\Z)", re.S)
 LOOKS_LIKE_CALL = re.compile(r"""\s*\{\s*["']?(tool|name)["']?\s*:""")
 SHELL_ONLY_RE = re.compile(r"\s*```[ \t]*(?:shell|bash|sh|cmd|bat|powershell|console)[ \t]*\n(.*?)```\s*", re.S | re.I)
+EXTRA_CALL_RE = re.compile(r"""\{\s*["']tool["']\s*:""")
 BARE_RE = re.compile(r"""^[ \t]*\{\s*"tool"\s*:.*\}[ \t]*$""", re.M)
 DECODER = json.JSONDecoder(strict=False)  # strict=False allows raw newlines inside strings
 
@@ -140,6 +160,19 @@ def parse_tool_call(text):
         return "shell", {"command": " && ".join(s.strip() for s in m.group(1).splitlines() if s.strip())}, len(text)
     m = BARE_RE.search(text)  # small models sometimes skip the fence
     return (*_parse_call(m.group()), m.end()) if m else None
+
+
+def file_from_reply(reply):
+    """Return the text of the first code block in reply, or None when there is no block or it is empty."""
+    lines = reply.split("\n")
+    start = next((i for i, s in enumerate(lines) if s.lstrip().startswith("```")), None)
+    if start is None:
+        return None
+    # ponytail: the last bare fence closes the block, so a Markdown file holding code fences stays whole; prose
+    # that follows the block with a fenced snippet of its own would be swallowed into the file.
+    end = next((i for i in range(len(lines) - 1, start, -1) if lines[i].strip() == "```"), len(lines))
+    body = "\n".join(lines[start + 1:end])
+    return body + "\n" if body.strip() else None
 
 
 def call_complete(text):
@@ -192,7 +225,8 @@ def call_summary(name, args):
     """One-line description of a tool call, shown instead of the raw block."""
     path, n = args.get("path") or ".", len(str(args.get("content", "")).splitlines())
     lines = f" lines {args.get('start') or 1}-{args.get('end') or 'end'}" if args.get("start") or args.get("end") else ""
-    return {"read": path + lines, "write": f"{path} ({n} line{'s' * (n != 1)})", "edit": path, "ls": path,
+    return {"read": path + lines, "write": path + (f" ({n} line{'s' * (n != 1)})" if "content" in args else ""),
+            "edit": path, "ls": path,
             "grep": f'"{args.get("pattern")}" in {path}', "shell": str(args.get("command"))}[name]
 
 
@@ -461,6 +495,7 @@ class Agent:
         self.base = re.sub(r"/v1$", "", self.url)
         self.native = self.is_ollama()
         self.ratio, self.last_used, self.last_note, self.allowed = 3.0, None, "", set()
+        self.truncated = False
         self.set_limits(ctx, max_tokens, max_prompt)
         self.set_sampling(temperature, max_steps)
         self.model = model or self.pick_model()
@@ -511,11 +546,13 @@ class Agent:
         # server's prompt_tokens; it can be off for unusual text. Upgrade: a real tokenizer or llama.cpp's /tokenize.
         return int(sum(len(m["content"]) for m in msgs) / self.ratio) + 4 * len(msgs)
 
-    def stream(self, msgs):
+    def stream(self, msgs, stop_at_call=True):
         """Send msgs, print the reply as it streams, and return (text, server prompt tokens or None)."""
         if self.native:  # Ollama's /v1 ignores num_ctx, so use the native API there
-            url, body = self.base + "/api/chat", {"model": self.model, "messages": msgs, "stream": True, "options": {
-                "num_ctx": self.ctx, "num_predict": self.max_tokens, "temperature": self.temperature}}
+            # think=False: thinking models (qwen3.5, ...) would otherwise spend max-tokens on hidden reasoning localcode never shows
+            url, body = self.base + "/api/chat", {"model": self.model, "messages": msgs, "stream": True, "think": False,
+                                                  "options": {"num_ctx": self.ctx, "num_predict": self.max_tokens,
+                                                              "temperature": self.temperature}}
         else:
             url, body = self.url + "/chat/completions", {
                 "model": self.model, "messages": msgs, "stream": True, "max_tokens": self.max_tokens,
@@ -540,20 +577,22 @@ class Agent:
                     if self.native:
                         piece = (ev.get("message") or {}).get("content") or ""
                         used = ev.get("prompt_eval_count", used)
+                        self.truncated |= ev.get("done_reason") == "length"
                     else:
                         piece = "".join((c.get("delta") or {}).get("content") or "" for c in ev.get("choices") or [])
                         used = (ev.get("usage") or {}).get("prompt_tokens", used)
+                        self.truncated |= any(c.get("finish_reason") == "length" for c in ev.get("choices") or [])
                     if piece:
                         md.feed(piece)
                         text.append(piece)
                         # closing the connection stops generation; cost: no server prompt count for this reply
-                        if ("`" in piece or ">" in piece) and call_complete("".join(text)):
+                        if stop_at_call and ("`" in piece or ">" in piece) and call_complete("".join(text)):
                             break
         finally:  # also on Ctrl+C, so styles never leak into the prompt
             md.close()
         return "".join(text), used
 
-    def ask_model(self):
+    def ask_model(self, stop_at_call=True):
         """Send a copy of the history trimmed to the prompt budget, stream one reply and correct the token ratio."""
         msgs, note = trim(self.history, self.max_prompt, self.count)  # full history stays, so /maxprompt can grow back
         if note and note != self.last_note:  # print once, not on every tool step
@@ -562,22 +601,42 @@ class Agent:
         if (est := self.count(msgs)) > self.max_prompt:
             dim(f"[warning: prompt ~{est} tokens is still over max-prompt {self.max_prompt}]")
         msgs = [{"role": m["role"], "content": m["content"]} for m in msgs]
-        text, used = self.stream(msgs)
+        self.truncated = False  # stream() sets it when the server says the reply hit max-tokens
+        text, used = self.stream(msgs, stop_at_call)
+        if self.truncated:
+            dim(f"[the reply was cut off at max-tokens {self.max_tokens}; raise it with /maxtokens N (it must stay below ctx {self.ctx})]")
         if used and used > 4 * len(msgs):  # 0.9 keeps the estimate on the high side
             chars = sum(len(m["content"]) for m in msgs)
             self.ratio = min(6.0, max(1.5, 0.9 * chars / (used - 4 * len(msgs))))
             self.last_used = used
         return text
 
-    def permitted(self, name, args):
+    def fetch_file(self, path):
+        """After a write call without content, ask the model for the file text; return (text, None) or (None, error)."""
+        self.history.append({"role": "user", "content": ASK_FILE.format(path=path), "tool": True})
+        reply = self.ask_model(stop_at_call=False)
+        self.history.append({"role": "assistant", "content": reply})
+        if self.truncated:  # a cut-off file would be written half finished
+            return None, CUT_OFF
+        text = file_from_reply(reply)
+        return (text, None) if text else (None, NO_BLOCK)
+
+    def permitted(self, name, args, streamed=False):
         """Ask y/n/a before a tool that changes things; 'a' allows that tool for the session."""
         if name not in ASK or name in self.allowed:
             return True
-        if name == "edit":  # shell and write are fully described by the summary line above
+        what = name
+        if name == "edit":  # shell is fully described by the summary line above
             print("\n".join([paint(f"    - {show(s)}", "red") for s in str(args["old"]).splitlines()]
                             + [paint(f"    + {show(s)}", "green") for s in str(args["new"]).splitlines()]), flush=True)
+        elif name == "write":
+            body = str(args["content"]).splitlines()
+            what = f"write {show(args['path'])} ({len(body)} line{'s' * (len(body) != 1)})"
+            if not streamed:  # content that was streamed to the screen has just been seen; content inside the call was hidden
+                print("\n".join([paint(f"    {show(s)[:120]}", "dim") for s in body[:5]]
+                                + [paint(f"    ... ({len(body) - 5} more lines)", "dim")] * (len(body) > 5)), flush=True)
         try:
-            ans = input(paint(f"  allow {name}? [y/n/a] ", "bold")).strip().lower()
+            ans = input(paint(f"  allow {what}? [y/n/a] ", "bold")).strip().lower()
         except EOFError:
             ans = "n"
         if ans == "a":
@@ -590,11 +649,13 @@ class Agent:
             user_text = self.history.pop()["content"] + "\n\n" + user_text
         self.history.append({"role": "user", "content": user_text})
         corrected, denied = False, set()  # one correction per user turn; calls the user said no to
+        used, seen, repeats, cuts = [], set(), 0, 0  # tools run this turn; calls made since the last change; repeats; cut-off files
         for step in range(self.max_steps + 1):
             reply = self.ask_model()
             try:
                 call = parse_tool_call(reply)
             except ValueError as e:
+                e = CUT_OFF_CALL if self.truncated else e  # a cut-off call looks like bad JSON; say what really happened
                 self.history.append({"role": "assistant", "content": reply})
                 if corrected:
                     self.md.status(paint(f"[model sent a malformed tool call again ({e}); stopping this turn]", "dim"))
@@ -611,25 +672,68 @@ class Agent:
             self.md.status(f"{paint('●', 'green')} {paint(name, 'bold')} {show(call_summary(name, args))}")
             if step == self.max_steps:
                 break
+            result, streamed = None, False
+            if name == "write" and "content" not in args:  # two-step write: the file text comes in a code block
+                text, result = self.fetch_file(args["path"])
+                if text is not None:
+                    args, streamed = {**args, "content": text}, True
+                elif result == CUT_OFF:
+                    cuts += 1
+                    if cuts > 1:  # each attempt can cost minutes on a slow machine, and the model rarely shortens it
+                        dim("[the file was cut off twice; raise /maxtokens or ask for a smaller file. Asking for a final answer]")
+                        self.history.append({"role": "user", "content": f"[write result]\n{CUT_OFF}", "tool": True})
+                        self.finish()
+                        return
             key = json.dumps([name, args], sort_keys=True, default=str)
-            if key in denied:  # small models tend to repeat a denied call; don't ask again
-                dim(f"[model repeated a denied {name} call; stopping this turn]")
-                return
-            if not self.permitted(name, args):
-                denied.add(key)
-                self.history.append({"role": "user", "content": f"[{name} result]\n{DENIED}", "tool": True})
-                dim(f"[{name} denied; the model will try something else]")
-                continue
-            try:
-                result = TOOLS[name](args)
-            except Exception as e:  # tool errors go back to the model so it can fix its call
-                result = f"error: {e}"
+            if result is None and key in seen:  # small models redo the same call until the step cap; make them answer instead
+                repeats += 1
+                if repeats > 1:
+                    dim(f"[model kept repeating the same {name} call; asking it for a final answer]")
+                    self.finish()
+                    return
+                result = REPEAT
+            if result is None:
+                if key in denied:  # small models tend to repeat a denied call; don't ask again
+                    dim(f"[model repeated a denied {name} call; stopping this turn]")
+                    return
+                if not self.permitted(name, args, streamed):
+                    denied.add(key)
+                    self.history.append({"role": "user", "content": f"[{name} result]\n{DENIED}", "tool": True})
+                    dim(f"[{name} denied; the model will try something else]")
+                    continue
+                try:
+                    result = TOOLS[name](args)
+                except Exception as e:  # tool errors go back to the model so it can fix its call
+                    result = f"error: {e}"
+                if name in ASK:
+                    seen.clear()  # files may have changed, so reading or listing again is legitimate
+                seen.add(key)
+            used.append(name)
             lines = result.splitlines() or ["(no output)"]
             shown = lines[:8] + [f"... ({len(lines) - 8} more lines)"] * (len(lines) > 8)
             dim("\n".join(("  └ " if i == 0 else "    ") + s for i, s in enumerate(shown)))
             cap = max(400, int(self.max_prompt * self.ratio / 4))  # one result may use about 1/4 of the prompt budget
-            self.history.append({"role": "user", "content": f"[{name} result]\n{cut(result, cap)}\n{NUDGE}", "tool": True})
-        dim(f"[stopped: {self.max_steps} tool steps in one turn]")
+            note = EXTRA_NOTE * bool(EXTRA_CALL_RE.search(reply[end:]))
+            task = " ".join(user_text.split())[:300]
+            self.history.append({"role": "user", "content": f"[{name} result]\n{cut(result, cap)}\n{note}{NUDGE.format(task=task, used=', '.join(used))}",
+                                 "tool": True})
+        dim(f"[stopped: {self.max_steps} tool steps in one turn; asking the model for a final answer]")
+        self.finish()
+
+    def finish(self):
+        """End a turn that was going nowhere by asking the model once for a plain-text answer."""
+        if self.history[-1]["role"] == "user":  # keep the roles alternating
+            self.history[-1]["content"] += "\n" + FINAL
+        else:
+            self.history.append({"role": "user", "content": FINAL, "tool": True})
+        reply = self.ask_model()
+        self.history.append({"role": "assistant", "content": reply})
+        try:
+            wants_tool = parse_tool_call(reply) is not None
+        except ValueError:
+            wants_tool = True
+        if wants_tool:  # ignored on purpose; the turn is over
+            self.md.status(paint("[the model asked for another tool; ending the turn]", "dim"))
 
     def tokens(self):
         sent = self.count(trim(self.history, self.max_prompt, self.count)[0])
@@ -710,7 +814,7 @@ def main():
                     help="model name (env LOCALCODE_MODEL; default: first from /v1/models)")
     ap.add_argument("--ctx", type=int, default=8192, help="model context window in tokens (default %(default)s)")
     ap.add_argument("--max-prompt", type=int, help="prompt token cap per request (default ctx minus max-tokens)")
-    ap.add_argument("--max-tokens", type=int, default=1024, help="reply token cap (default %(default)s)")
+    ap.add_argument("--max-tokens", type=int, default=2048, help="reply token cap (default %(default)s)")
     ap.add_argument("--temperature", type=float, default=0.2, help="sampling temperature, 0 to 2 (default %(default)s)")
     ap.add_argument("--max-steps", type=int, default=10, help="tool-call cap per user turn (default %(default)s)")
     ap.add_argument("--verbose", action="store_true", help="show raw tool-call blocks (toggle with /verbose)")
